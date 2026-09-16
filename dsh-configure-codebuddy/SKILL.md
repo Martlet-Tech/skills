@@ -1,15 +1,15 @@
 ---
 name: dsh-configure-codebuddy
-description: Configures DeepSeek Harness (DSH) to route models through the Tencent CodeBuddy (or WorkBuddy) subscription gateway instead of the official DeepSeek API. Use when a user wants to add, debug, or repair a hand-declared OpenAI-compatible provider route in DSH settings.yaml — including credential setup, protocol/compat quirks of the gateway, and enabling image (multimodal) input on such a route.
-whenToUse: Use when setting up or troubleshooting a DSH provider route to CodeBuddy/WorkBuddy, or when pasted images are rejected on a hand-declared DSH route with UNSUPPORTED_CONTENT.
+description: Configures DeepSeek Harness (DSH) to route models through the Tencent CodeBuddy (or WorkBuddy) subscription gateway instead of the official DeepSeek API. Use when a user wants to add, debug, or repair a hand-declared OpenAI-compatible provider route in DSH settings.yaml — including credential setup, protocol/compat quirks of the gateway, enabling image (multimodal) input, and making reasoning effort actually take effect on such a route.
+whenToUse: Use when setting up or troubleshooting a DSH provider route to CodeBuddy/WorkBuddy, when pasted images are rejected on a hand-declared DSH route with UNSUPPORTED_CONTENT, or when the route answers but never thinks — no effort entry in the model picker, no reasoning blocks in the session log, or a bodyless 400 as soon as reasoning is declared.
 ---
 
 # Configure CodeBuddy / WorkBuddy as a DSH provider
 
 Route DeepSeek Harness model traffic through a Tencent CodeBuddy subscription
 gateway. This skill covers the whole path: credential, route declaration,
-gateway dialect quirks, and the multimodal (`input`) declaration that is
-routinely missed on hand-written routes.
+gateway dialect quirks, and the two declarations a hand-written route is
+routinely missing — `input` (images) and `reasoningEfforts` (thinking).
 
 ## When to use this skill
 
@@ -18,6 +18,8 @@ routinely missed on hand-written routes.
   streams but never answers.
 - **Pasted images are rejected** on such a route (often surfaced as
   `UNSUPPORTED_CONTENT`, `does not support image input`).
+- **The route never thinks** — no effort entry in the model picker, no
+  `reasoning` content blocks in the session log. See Step 3.
 
 ## Background: why a hand-written route is needed
 
@@ -75,21 +77,100 @@ llm-pi-ai:
           name: DeepSeek V4.1 Flash
           contextWindow: 512000
           maxTokens: 32768
-          input: [text, image]     # see Step 3 — do not omit on a vision model
+          input: [text, image]     # see Step 4 — do not omit on a vision model
+          compat:
+            # A replayed assistant turn needs an empty reasoning_content while
+            # reasoning is on; DeepSeek-dialect gateways expect the field.
+            requiresReasoningContentOnAssistantMessages: true
+          reasoningEfforts:        # see Step 3 — omit this and the model never thinks
+            off:
+            high: high
+            max: max
         - id: deepseek-v4-flash
           name: DeepSeek V4 Flash
           contextWindow: 131072
           maxTokens: 32768
 ```
 
+`baseURL` is host-specific and used verbatim:
+
+| Gateway | baseURL |
+|---|---|
+| CodeBuddy (public product) | `https://www.codebuddy.cn/v2` |
+| WorkBuddy (ships `endpoint: https://copilot.tencent.com`) | `https://copilot.tencent.com/v2` |
+
 For WorkBuddy, keep the structure identical and change only `baseURL`, the
 route key, and the credential name to match that gateway. Everything else
-(`api`, `compat`, `input` handling) is the same adapter behavior.
+(`api`, `compat`, `input`, reasoning handling) is the same adapter behavior.
 
 Settings are re-read **per request**, so edits take effect on the next turn with
 no restart.
 
-## Step 3 — declare image support (the commonly missed step)
+## Step 3 — declare reasoning effort (the other commonly missed step)
+
+Omitting `reasoningEfforts` on a hand-declared model does more than leave the
+effort menu empty: DSH registers the model as **non-reasoning** and sends no
+thinking field at all, so the endpoint's own default decides — and on a gateway
+that defaults to off, the route never thinks.
+
+The decision lives in `dsh-llm-pi-ai`'s `resolveModelReasoning()`:
+
+```js
+// A hand-declared model has no installed catalog entry, so `base` is undefined
+// and this line decides: reasoning = false.
+if (efforts === undefined) return { reasoning: base?.reasoning ?? false }
+```
+
+`codebuddy` is not a pi-ai provider id, so `catalogProvider("codebuddy")`
+returns `undefined` and there is no `base` to inherit from. `reasoningInfo()`
+then withholds the capability outright — `if (!model.reasoning) return {}` —
+which is why the model picker shows no effort entry at all rather than a
+disabled one.
+
+Declare the levels the gateway accepts. Each key is a level the picker offers
+and its value is the spelling sent on the wire, so `max: xhigh` can rename a
+level for a gateway with its own vocabulary. Only `off` may be left valueless:
+
+```yaml
+          reasoningEfforts:
+            off:                     # valueless = "supported, send nothing"
+            high: high
+            max: max
+```
+
+The seven level names are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`; a level absent from the dict is not offered. For DeepSeek V4, pi-ai's own
+catalog entry declares `high` and `max` only (it pins `low`/`medium` to null),
+which is a safe starting pair. Leaving `off` empty sends no reasoning field at
+all, which only stops a model that thinks on request; with
+`compat.thinkingFormat: deepseek` set (as in Step 2), `off` instead sends
+`thinking: {type: disabled}` and every other level sends `thinking: {type: enabled}`
+beside the effort.
+
+### Two ways this goes wrong
+
+- **A route-level `reasoning:` on its own.** Setting `reasoning: high` on the
+  route while the model still declares no `reasoningEfforts` keeps the model
+  non-reasoning, and every request then fails locally with
+  `UNSUPPORTED_REASONING_EFFORT` — there is no supported level to select. The
+  field itself is valid, so nothing refuses it when written; declare the levels
+  as well.
+- **A bodyless `400` the moment the model becomes a reasoning model.** pi-ai
+  sends the system prompt with `role: "developer"` *only* to a reasoning model,
+  and this gateway rejects that role. The tell is that the 400 begins exactly
+  when `reasoningEfforts` appears and **persists even with no effort selected**
+  — it is the request shape, not the `reasoning_effort` value. Fix with
+  `compat.supportsDeveloperRole: false` (already in the Step 2 block); if it
+  survives that, add `compat.maxTokensField: max_tokens`.
+
+Verify from the session log rather than by feel. `<DSH_HOME>/sessions/<cwd>/session-*/session.v3.jsonl.zstd`
+is **multi-frame** zstd — Node's `zlib.zstdDecompressSync` reads only the first
+frame, so use a streaming reader. In the JSONL, `request/header` carries the
+per-call `config` (`{provider, model, reasoningEffort?}`), and an assistant
+message that thought records `reasoning` entries in `message.content[].type`.
+No `reasoning` block means no thinking.
+
+## Step 4 — declare image support
 
 A hand-written route that omits `input` is treated as **text-only**, because
 pi-ai falls back to `DEFAULT_INPUT = ["text"]`. DSH then refuses an image
@@ -122,6 +203,7 @@ succeed. Confirm real image reading with a solid-color PNG and a color question
 
 ```bash
 # Must use stream:true — see gateway quirks below.
+# Host: use the baseURL from the table in Step 2.
 curl -sS https://www.codebuddy.cn/v2/chat/completions \
   -H "Authorization: Bearer $CODEBUDDY_API_KEY" \
   -H 'Content-Type: application/json' \
@@ -141,21 +223,26 @@ it sees none.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `400 {"code":11101,"msg":"Non-stream chat request is currently not supported"}` | Gateway **requires** streaming | Send `"stream": true`. DSH always streams, so this only bites hand-rolled scripts. |
-| `400` with an **empty** body | Usually this same non-stream rejection; the body is only readable on some clients | Retry with streaming before assuming an auth problem. |
-| `404 {"error_msg":"404 Route Not Found"}` | Wrong path | Endpoint is `https://www.codebuddy.cn/v2/chat/completions`. `/v1/...` and `/v2/v1/...` do not exist. |
+| `400` with an **empty** body | Either the non-stream rejection above, or a reasoning model's `developer` role (next row) | Check whether `reasoningEfforts` is declared before assuming either cause. |
+| `400` with an **empty** body, appearing the moment reasoning is declared | Reasoning models get `role: "developer"` for the system prompt; this gateway rejects it | `compat.supportsDeveloperRole: false`. See Step 3. |
+| `404 {"error_msg":"404 Route Not Found"}` | Wrong path | Endpoint is `https://<host>/v2/chat/completions`. `/v1/...` and `/v2/v1/...` do not exist. |
 | `504` | Wrong bearer token on the route | Check `.credentials.yaml` — see the Models-page warning in Step 1. |
-| Images rejected locally | `input` not declared | Step 3. |
+| Images rejected locally | `input` not declared | Step 4. |
+| No effort entry in the picker; the route never thinks | Hand-declared model without `reasoningEfforts` | Step 3. |
+| `UNSUPPORTED_REASONING_EFFORT`, no request sent | Route-level `reasoning:` with no model-level `reasoningEfforts` | Step 3. |
 
 Note the baseURL is used verbatim — the adapter does **not** append
 `/v1`. `baseURL: https://www.codebuddy.cn/v2` plus the client's own
 `/chat/completions` produces the correct URL.
 
-## Step 4 — verify
+## Step 5 — verify
 
 1. Confirm the route resolves and streams a text answer.
 2. If vision is claimed, paste an image through the DSH UI and confirm the
    model describes it correctly. An attachment that reaches the model arrives
    as a normalized copy under `<DSH_HOME>/attachments/`.
+3. If reasoning is claimed, confirm the picker offers the declared levels and
+   that a thinking turn logs `reasoning` content blocks (see Step 3).
 
 ## Troubleshooting checklist
 
@@ -168,6 +255,12 @@ Note the baseURL is used verbatim — the adapter does **not** append
 - **Route works, then stops after a settings edit** → a refused section keeps
   the namespace's last good value, so a malformed edit can look like a no-op.
   Check the log for `keeping the previously registered routes`.
+- **No effort entry, or the route never thinks** → the hand-declared model has
+  no `reasoningEfforts`. Step 3.
+- **`UNSUPPORTED_REASONING_EFFORT`** → a route-level `reasoning:` without
+  model-level `reasoningEfforts`. Step 3.
+- **Bodyless `400` right after declaring reasoning** → the `developer` system
+  role. Step 3.
 - **Do not use `max_tokens` and `max_completion_tokens` interchangeably** —
   this gateway accepts `max_tokens` only, hence `maxTokensField: max_tokens`.
 
@@ -182,3 +275,8 @@ Note the baseURL is used verbatim — the adapter does **not** append
 - **Provider ids are lowercase hyphenated identifiers.** A key outside that
   grammar cannot address a stored credential record and so cannot use
   interactive sign-in; such routes must authenticate via `apiKeyEnv`.
+- **A `llm-deepseek` route is not a drop-in fallback.** It brings its own
+  `off`/`low`/`high`/`max` levels and defaults `reasoningEffort` to `high`, so
+  it reasons without any of the above — but its `baseURL` must be a **base**.
+  Writing `https://<host>/v1/chat/completions` there makes every request fail
+  (seen as `HTTP 403 AUTH` with a key that looks fine); drop the path.
