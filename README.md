@@ -10,7 +10,7 @@ skill root and it appears in the agent's catalog.
 
 | Skill | Description |
 |---|---|
-| [`dsh-configure-codebuddy`](dsh-configure-codebuddy/SKILL.md) | Configure DeepSeek Harness (DSH) to route models through the Tencent CodeBuddy / WorkBuddy subscription gateway — credentials, the hand-declared `llm-pi-ai` route, gateway dialect quirks, enabling image input, and making reasoning effort take effect. |
+| [`dsh-configure-codebuddy`](dsh-configure-codebuddy/SKILL.md) | Configure DeepSeek Harness (DSH) to route models through the Tencent CodeBuddy / WorkBuddy subscription gateway — credential, the hand-declared `llm-pi-ai` route, gateway dialect quirks, image input, and choosing a reasoning effort that doesn't starve the answer. |
 
 ## Install
 
