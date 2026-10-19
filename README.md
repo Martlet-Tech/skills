@@ -12,6 +12,7 @@ skill root and it appears in the agent's catalog.
 |---|---|
 | [`dsh-configure-codebuddy`](dsh-configure-codebuddy/SKILL.md) | Configure DeepSeek Harness (DSH) to route models through the Tencent CodeBuddy / WorkBuddy subscription gateway — credential, the hand-declared `llm-pi-ai` route, gateway dialect quirks, image input, and choosing a reasoning effort that doesn't starve the answer. |
 | [`dsh-publish-to-market`](dsh-publish-to-market/SKILL.md) | List a DSH plugin on the awesome-dsh-plugin marketplace (the list behind dsh-market) — the one-file submission format, the hard eligibility gates (`dsh.bundle` manifest, 1-day repo age, `dsh-plugin` topic), the `screenshots.json` convention, and the reasons submissions actually get sent back. |
+| [`lvgl-cjk-font`](lvgl-cjk-font/SKILL.md) | Make Chinese (CJK) text render correctly in LVGL — why the built-in `lv_font_simsun_*_cjk` fonts show tofu boxes and cap at 16 px, and how to generate a custom `lv_font_conv` bitmap font per design size containing only the characters the UI uses. Ships a `gen_fonts.py` that extracts the character set from string literals and regenerates every size. |
 
 ## Install
 
