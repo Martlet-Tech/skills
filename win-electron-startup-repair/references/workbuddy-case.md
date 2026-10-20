@@ -32,8 +32,8 @@ DisplayIcon     : C:\Program Files\WorkBuddy\WorkBuddyAI.exe,0
 
 ```
 C:\Program Files\WorkBuddy        8154 项，有 WorkBuddy.exe，没有 WorkBuddyAI.exe
-C:\Users\zt\AppData\Local\Programs\WorkBuddy     仅剩 version / debug.log / .update-installing  ← 空了
-C:\Users\zt\AppData\Local\Programs\WorkBuddyAI   仅剩 version / debug.log                        ← 空了
+C://Users//<user>\AppData\Local\Programs\WorkBuddy     仅剩 version / debug.log / .update-installing  ← 空了
+C://Users//<user>\AppData\Local\Programs\WorkBuddyAI   仅剩 version / debug.log                        ← 空了
 ```
 
 `.update-installing` 的内容直接点名了那次更新：
@@ -51,7 +51,7 @@ Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=(Get-Date).AddHo
 ```
 Id=1002 Application Hang
   程序 WorkBuddyAI.exe 版本 5.8.4.0 已停止与 Windows 交互并关闭
-  应用程序路径: C:\Users\zt\AppData\Local\Programs\WorkBuddy\WorkBuddyAI.exe
+  应用程序路径: C://Users//<user>\AppData\Local\Programs\WorkBuddy\WorkBuddyAI.exe
   挂起类型: Top level window is idle
 Id=1001 WER  AppHangB1  P1: WorkBuddyAI.exe  P2: 5.8.4.0
 ```
@@ -61,7 +61,7 @@ Id=1001 WER  AppHangB1  P1: WorkBuddyAI.exe  P2: 5.8.4.0
 
 ### 第 4 步：应用自己的日志说出"为什么不出窗口"
 
-`C:\Users\zt\.workbuddy\logs\`：
+`C://Users//<user>\.workbuddy\logs\`：
 
 - `startup\2026-10-18\14872-012242.log` 最后一行：
   `Phase: early silent startup update triggered, skipping window bootstrap`
@@ -92,10 +92,10 @@ Modified     = 2026/10/16 06:17  ← 已经卡了两天
 
 ### 第 6 步：谁删掉了 WorkBuddyAI.exe —— 安装日志说了
 
-`C:\Users\zt\.workbuddy\logs\installer.log`：
+`C://Users//<user>\.workbuddy\logs\installer.log`：
 
 ```
-[install-68122968] INFO install target dir: C:\Users\zt\AppData\Local\Programs\WorkBuddy
+[install-68122968] INFO install target dir: C://Users//<user>\AppData\Local\Programs\WorkBuddy
 [install-68122968] INFO wrote update install mark: ...\Programs\WorkBuddy\.update-installing
 [install-68122968] INFO install directory confirmed: C:\Program Files\WorkBuddy (access=yes)
 [install-68122968] INFO extraction sentinel OK: C:\Program Files\WorkBuddy\WorkBuddy.exe present
@@ -132,19 +132,19 @@ Windows 无法安装程序包 WorkBuddyShareTarget_5.8.3.0，因为已安装了�
 
 ```powershell
 # 1. 用卡住的那个包（它本身就是 WorkBuddy AI 5.8.4 完整安装包）重装国际版到独立目录
-$p    = "C:\Users\zt\AppData\Local\@genieworkbuddy-desktop-updater\installer.exe"
-$dir  = "C:\Users\zt\AppData\Local\Programs\WorkBuddyAI"
+$p    = "C://Users//<user>\AppData\Local\@genieworkbuddy-desktop-updater\installer.exe"
+$dir  = "C://Users//<user>\AppData\Local\Programs\WorkBuddyAI"
 Start-Process -FilePath $p -ArgumentList "/S","/D=$dir"
 # 轮询 WorkBuddyAI.exe 出现 + installer 进程退出 → 7629 个文件，Uninstall WorkBuddyAI.exe 生成
 
 # 2. 打破死循环
 Remove-Item $p -Force
 Remove-Item "$env:TEMP\workbuddy-update-x64","$env:TEMP\workbuddy-update-x64-workbuddy-ai" -Recurse -Force
-Remove-Item "C:\Users\zt\AppData\Local\Programs\WorkBuddy" -Recurse -Force   # 已空
+Remove-Item "C://Users//<user>\AppData\Local\Programs\WorkBuddy" -Recurse -Force   # 已空
 
 # 3. 重注册分享目标（必须用 Windows PowerShell 5.1，pwsh 7 加载不了 Appx 模块）
 $env:WB_SHT_INSTDIR = $dir
-$env:WB_SHT_LOG     = "C:\Users\zt\.workbuddy\logs\register.log"
+$env:WB_SHT_LOG     = "C://Users//<user>\.workbuddy\logs\register.log"
 powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
   -File "$dir\share-target\scripts\register.ps1"    # exit=0, register ok
 ```
