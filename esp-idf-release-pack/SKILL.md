@@ -351,9 +351,12 @@ for z in sys.argv[1:]:
             if n.endswith(('.bin', '.a', '.o', '.elf', '.png', '.jpg', '.zip', '.ttf')):
                 continue
             try:
-                t = zf.read(n).decode('utf-8', 'ignore')
+                raw = zf.read(n)
             except Exception:
                 continue
+            if b'\x00' in raw[:4096]:      # 二进制内容，当文本解码只会产生垃圾误报
+                continue
+            t = raw.decode('utf-8', 'ignore')
             for m in pat.finditer(t):
                 s = m.group(0)
                 if not bad.match(s):
