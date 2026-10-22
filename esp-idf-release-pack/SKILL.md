@@ -4,11 +4,14 @@ description: >
   Package an ESP-IDF project into a shippable release bundle — n original flash
   bins (whatever the partition table actually produces, not always 3), one
   merged bin writable from 0x0, a source zip without components, a source zip
-  with components, and a minimal README listing each bin's flash offset. Also
-  reconstructs IDF_PATH / IDF_TOOLS_PATH / toolchain paths from build/ when the
-  shell environment is gone. Use when a user says 打包发布 / 出 release / 出固件包
+  with components, a patch for local ESP-IDF modifications (when IDF_PATH itself
+  was edited, so the exact same bin can be rebuilt), and a minimal README listing
+  each bin's flash offset plus the IDF patch restore steps. Also reconstructs
+  IDF_PATH / IDF_TOOLS_PATH / toolchain paths from build/ when the shell
+  environment is gone. Use when a user says 打包发布 / 出 release / 出固件包
   / 发布固件 / 交付包 / 整合 bin / 合并 bin / merged bin / 烧录说明 / 反推 idf 路径
-  / idf 环境没了 / 换个电脑打包 / ESP-IDF release / firmware package.
+  / idf 环境没了 / 换个电脑打包 / idf 改过 / idf patch / 复现同一个 bin
+  / ESP-IDF release / firmware package.
 ---
 
 # ESP-IDF 发布包
@@ -59,6 +62,25 @@ IDF_PYTHON_ENV  = CMakeCache.txt 的 _Python3_EXECUTABLE 往上两级
 **python env 别用 glob 猜**：一台机器上经常同时存在 `idf5.5_py3.11_env` 和 `idf5.5_py3.12_env`，
 `ls -d ... | head -1` 是掷骰子。`CMakeCache.txt` 里的 `_Python3_EXECUTABLE` 是编译时**实际用的那个**。
 
+### `ESP_ROM_ELF_DIR` 是反推不出来的（**只有要重编时才需要**）
+
+`build/` 里**没有任何地方**记录这个变量。它只能靠 `IDF_TOOLS_PATH/tools/idf_tools.py`
+的 `tools.json` 里 `esp-rom-elfs` 的推荐版本 + 实际安装目录来定：
+
+```bash
+# 推荐版本
+python "$IDF_TOOLS_PATH/tools/idf_tools.py" list 2>/dev/null | grep esp-rom-elfs
+# 实际安装目录（版本号可能与推荐值不同，以目录里真实存在的为准）
+ls -d "$IDF_TOOLS_PATH/tools/esp-rom-elfs"/*/
+```
+
+典型值形如 `$IDF_TOOLS_PATH/tools/esp-rom-elfs/20241011`
+——**注意路径里有 `tools` 这一层**，且版本号可能是 `20241011` 这种较新的值，
+不要照抄别处的 `20240411`。
+
+**只打包、不重编的话，这个变量用不到**；只有接收方要重建 bin 时才会碰上，
+所以在 README 的环境变量模板里一并写清楚即可。
+
 ### 导出环境
 
 **bash（Git Bash / Linux / macOS）**
@@ -102,10 +124,226 @@ Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
 
 ---
 
+## 一点五、先查 IDF 本身有没有被改（**必做，不能跳**）
+
+> **为什么必须在打包前做这一步**
+>
+> 工程能编出这个 bin，靠的是"工程源码 + 特定版本的 IDF"。如果开发时动过 IDF 里的文件
+> （调试时打个日志、改个行为、把某个函数换掉），那么**光给源码包是复现不出同一个 bin 的**。
+> 接收方拿到源码包，在干净的同版本 IDF 上编译，会得到一个**不一样**的固件——
+> 而且往往不是明显报错，是"能跑但行为不对"，最难查。
+>
+> 所以：**IDF 有任何改动 → 必须产出 patch，和源码包并列，并在 README 里写清复原方法。**
+
+### 1. 定位 IDF 仓库
+
+`IDF_PATH` 从 `build/` 反推（见第一节）。它下面有 `.git/` 才能出 patch。
+
+```bash
+ls -d "$IDF_PATH/.git" || echo "!! IDF 不是 git 仓库，无法自动出 patch，需人工比对"
+```
+
+### 2. 过滤掉行尾噪声（**关键，否则 patch 会有上万个文件**）
+
+> Windows 上 IDF 发行版常见现象：整个仓库的 `git status` 显示一万多文件"已修改"，
+> 但实际内容一个字节都没变，只是磁盘是 CRLF、仓库是 LF。
+>
+> 如果直接 `git diff`，产出的 patch 会是**几十 MB、包含上万个文件**的垃圾。
+> 更糟的是——即使只挑出真正的文件，**普通 `git diff` 也会把整个文件显示成"全删全增"**
+> （实测 `mipi_dsi_hal.c` 会变成 `323 insertions / 258 deletions`，全文重写），
+> patch 虽然可能 apply 得上，但完全不可读，换个行尾设置就容易失败。
+>
+> **正确做法是两步：先筛文件（本文），再出干净 diff（下一节）。**
+
+### 2a. 筛出真实改动的文件
+
+不要用 `git diff --name-only` 的结果直接判断——它列的是"有差异"，不是"有内容差异"，
+而且 `--ignore-cr-at-eol` 对 `--name-only` **无效**（实测仍返回上万个文件）。
+
+唯一可靠的做法是**规范化行尾后逐文件比对**：
+
+```bash
+python - "$IDF_PATH" <<'PY'
+import subprocess, os, sys
+idf = sys.argv[1]
+
+# 只扫源码相关目录和扩展名, 不要全仓库扫(太慢, 且文档/CI 的改动通常不影响 bin)
+roots = ['components', 'tools']
+exts  = ('.c', '.h', '.cpp', '.hpp', '.cc', '.py', '.cmake', '.txt', '.S', '.s')
+
+out = subprocess.run(['git', '-C', idf, 'diff', '--name-only', '--'] + roots,
+                     capture_output=True, text=True, encoding='utf-8', errors='ignore')
+files = [f for f in out.stdout.split('\n') if f.strip() and f.endswith(exts)]
+
+real = []
+for f in files:
+    p = os.path.join(idf, f)
+    if not os.path.exists(p):
+        real.append((f, 'DELETED'));  continue
+    r = subprocess.run(['git', '-C', idf, 'show', 'HEAD:' + f], capture_output=True)
+    if r.returncode != 0:
+        real.append((f, 'UNTRACKED'));  continue
+    a = r.stdout.replace(b'\r\n', b'\n')
+    b = open(p, 'rb').read().replace(b'\r\n', b'\n')
+    if a != b:
+        real.append((f, 'len %d -> %d' % (len(a), len(b))))
+
+print('候选:', len(files), ' 真实改动:', len(real))
+for f, why in real:
+    print('  %-72s %s' % (f, why))
+PY
+```
+
+**扫完要人工看一眼分类**，有两类结果**不能进 patch**：
+
+| 情况 | 处理 |
+|---|---|
+| `DELETED` 且原文件是 `mode 120000`（符号链接） | **不要进 patch**。Windows 解压不落地软链，不是人为改动；盲目纳入会让接收方 `git apply` 时误删文件 |
+| 只在 `examples/`、`docs/` 下的改动 | 一般不影响 bin，确认后可排除 |
+
+判断是不是软链接：
+
+```bash
+git -C "$IDF_PATH" ls-files -s -- <file>    # 首列 120000 就是符号链接
+```
+
+还要单独看一眼**未跟踪文件**（新增源码不会被 `git diff` 列出）：
+
+```bash
+git -C "$IDF_PATH" status --porcelain -- components tools | grep '^??' | grep -E '\.(c|h|cpp|py|cmake)$'
+```
+
+**辅助判断**：如果开发时留过日志标记（比如自定义 TAG），直接搜更快更准：
+
+```bash
+grep -rl "<你的自定义TAG>" "$IDF_PATH/components" --include=*.c --include=*.h
+```
+
+### 2b. 出干净 diff（**必须加 `-c core.autocrlf=true`**）
+
+这是最容易漏的一步。对已经筛出来的文件逐个出 diff 时：
+
+```bash
+# ✗ 错的: 得到整个文件重写 (323+/258-)
+git -C "$IDF_PATH" diff -- <file>
+
+# ✓ 对的: 得到真正的最小 hunk (67+/2-)
+git -C "$IDF_PATH" -c core.autocrlf=true diff -- <file>
+```
+
+`--ignore-cr-at-eol` 对**内容输出**也有效（同样得到 67+/2-），但它对 `--name-only` 无效，
+所以**筛文件仍然必须用 2a 的逐文件比对**，两者不能互相替代。
+
+判断 patch 是否干净，看 hunk 规模：
+
+```bash
+# 每个文件的增删行数, 应该都是小数字
+git -C "$IDF_PATH" -c core.autocrlf=true diff --numstat -- <files...>
+```
+
+如果一个文件显示几百增删、而你只改了十几行，说明行尾还混在里面，**不要交这个 patch**。
+
+### 3. 产出 patch
+
+只对**真实改动的文件**出 diff，不要整个仓库出。**注意必须加 `-c core.autocrlf=true`**，
+否则每个文件都会变成全文重写：
+
+```bash
+python - "<IDF_PATH>" "<out>/idf-modifications.patch" "<files.txt>" <<'PY'
+import subprocess, sys, os
+idf, dst, listfile = sys.argv[1], sys.argv[2], sys.argv[3]
+files = [l.strip() for l in open(listfile) if l.strip()]   # 上一步筛出来的清单
+
+chunks = []
+for f in files:
+    # ★ -c core.autocrlf=true 是关键: 不加会得到整文件重写的脏 diff
+    r = subprocess.run(['git', '-C', idf, '-c', 'core.autocrlf=true',
+                        'diff', '--no-color', '--no-ext-diff', '--', f],
+                       capture_output=True)
+    if r.stdout:
+        chunks.append(r.stdout)
+
+with open(dst, 'wb') as fp:
+    fp.write(b''.join(chunks))
+print('patch 写出:', dst, os.path.getsize(dst), '字节, 覆盖', len(files), '个文件')
+PY
+```
+
+**出完必须自检 hunk 规模**，这是判断 patch 干净与否的唯一硬指标：
+
+```bash
+# 每个文件的 +行数 / -行数，应都是小数字
+git -C "$IDF_PATH" -c core.autocrlf=true diff --numstat -- <files...>
+
+# 或直接数 patch 里的增删行
+grep -c '^+[^+]' "$OUT/idf-modifications.patch"
+grep -c '^-[^-]' "$OUT/idf-modifications.patch"
+```
+
+参考：实测一个只改了十几行的文件，干净 patch 是 `+67/-2`；不干净是 `+323/-258`。
+**看到增删数接近文件总行数，就是脏的，重做。**
+
+**patch 必须是 `git diff` 格式**（带 `diff --git a/... b/...` 头），这样接收方能直接 `git apply`。
+同时确认 patch 是纯 LF（`CRLF 计数 = 0`），避免把行尾问题带给接收方。
+
+记录 IDF 的基线版本，写进 README——patch 只能打在**同一个基线**上：
+
+```bash
+git -C "$IDF_PATH" rev-parse HEAD          # 完整 commit
+git -C "$IDF_PATH" describe --tags 2>/dev/null || git -C "$IDF_PATH" log -1 --pretty=%s
+```
+
+### 4. 验证 patch 能否还原（**必做**）
+
+不能只看"patch 文件生成了"就完事。在临时副本上真的打一遍：
+
+```bash
+# 用 git worktree / 临时 clone 造一份干净的基线, 在副本里验证, 绝不动开发用的 IDF
+TMP=$(mktemp -d)
+git -C "$IDF_PATH" worktree add --detach "$TMP/idf-check" HEAD
+git -C "$TMP/idf-check" apply --check "$OUT/idf-modifications.patch" && echo "patch 可用"
+git -C "$TMP/idf-check" apply         "$OUT/idf-modifications.patch"
+# 打完 patch 后应与开发机的 IDF 内容一致 (忽略行尾)
+git -C "$IDF_PATH" worktree remove --force "$TMP/idf-check"
+rm -rf "$TMP"
+```
+
+`apply --check` 失败通常是两个原因：基线不同（不是同一个 IDF commit），或 patch 里混进了行尾噪声。
+
+**打完 patch 一定要逐字节比对**，`apply` 成功不等于内容对：
+
+```bash
+python - "<IDF_PATH>" "<worktree>" "<files.txt>" <<'PY'
+import sys, os
+idf, wt, listfile = sys.argv[1], sys.argv[2], sys.argv[3]
+files = [l.strip() for l in open(listfile) if l.strip()]
+allok = True
+for f in files:
+    a = open(os.path.join(wt,  f), 'rb').read().replace(b'\r\n', b'\n')
+    b = open(os.path.join(idf, f), 'rb').read().replace(b'\r\n', b'\n')
+    ok = (a == b); allok &= ok
+    print('%-60s %s' % (os.path.basename(f), '一致' if ok else '★不一致'))
+print('全部一致:', allok)
+PY
+```
+
+**必须全部"一致"才算通过。** 只跑到 `apply --check` 通过是不够的。
+
+### 5. 一致性判定表
+
+| IDF 状态 | 要不要 patch | 说明 |
+|---|---|---|
+| 干净（无改动） | 不要 | 只给源码包 + IDF 版本号即可 |
+| 只有行尾差异 | **不要** | 内容一致，产 patch 反而误导（上万个文件） |
+| 有真实内容改动 | **必须** | 否则复现不出同一个 bin |
+| IDF 不是 git 仓库 | 人工处理 | 让用户手工备份被改文件，README 里点名 |
+
+---
+
 ## 二、输出结构
 
 ```
-release/<序号>. <一句话说明>/
+release/<YYYYMMDD-HHMMSS>_<project_name>/
 ├── firmware/                          ← 固件包
 │   ├── <project>-<YYYYMMDD>-<hash>.bin        ← 整合 bin，从 0x0 写
 │   ├── bootloader.bin                          ┐
@@ -114,13 +352,38 @@ release/<序号>. <一句话说明>/
 │   └── ... （用户自定义分区的额外 bin）          ┘  可能是 3 个，也可能 5 个）
 ├── src-full-<YYYYMMDD>.zip            ← 源码包（带 managed_components）
 ├── src-lite-<YYYYMMDD>.zip            ← 源码包（不带 managed_components）
-└── README.md                          ← 极简烧录说明
+├── idf-modifications.patch            ← 仅当 IDF 有真实改动时出现
+└── README.md                          ← 极简烧录说明（含 patch 复原步骤）
 ```
+
+**`idf-modifications.patch` 只在 IDF 有真实改动时才放**。IDF 干净时不要放空 patch 或全零 patch，
+那会让接收方误以为需要额外操作。
 
 **命名规则**
 
-- **序号**：看 `release/` 下已有的 `N. xxx` 目录，取最大 N + 1
-- **说明**：取 HEAD commit 摘要（`git log -1 --pretty=%s`），太长截断到 20 字
+- **目录名**：`<YYYYMMDD-HHMMSS>_<project_name>`，例 `20261022-154012_mipi_dsi_panel`
+
+  基于**打包时刻的本地时间**，不用序号、不用 commit 摘要。原因：
+  - commit 摘要常含 `:`、`/`、`\` 等 Windows 非法字符，替换后很难看（`1. 修正_ 去掉 flush_cb 里的 R`）
+  - 摘要截断到 20 字往往断在词中间，可读性差
+  - 时间戳天然唯一、单调递增、可排序、跨平台安全，且能直接看出这包是什么时候出的
+
+  ```bash
+  STAMP=$(date +%Y%m%d-%H%M%S)
+  DIR="release/${STAMP}_${PROJECT_NAME}"
+  ```
+
+  PowerShell：
+
+  ```powershell
+  $STAMP = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $DIR = "release/${STAMP}_$PROJECT_NAME"
+  ```
+
+  同一秒内重复打包的概率可忽略；若目录已存在，追加 `-2`、`-3` 即可，**不要删旧包**。
+
+  commit 信息不丢——它已经在 `README.md` 的版本行和 bin 文件名里，目录名不必重复承载。
+
 - **文件名**：`<project_name>-<YYYYMMDD>-<git短哈希>`，例 `mipi_dsi_panel-20261020-848e214`
 
 短哈希取法（**别用 `git_revision`，那是 IDF 自己的版本**）：
@@ -204,7 +467,7 @@ head -1 "$BUILD/flash_args"
 **推荐做法：绕过 idf.py，直接用 esptool 并显式给容量。**
 
 ```bash
-OUT="$(pwd)/release/<序号>. <说明>/firmware/<project>-<date>-<hash>.bin"
+OUT="$(pwd)/release/${STAMP}_${PROJECT_NAME}/firmware/<project>-<date>-<hash>.bin"
 python - "$BUILD" "$OUT" <<'PY'
 import json, re, subprocess, sys, os
 build, out = sys.argv[1], os.path.abspath(sys.argv[2])
@@ -264,8 +527,12 @@ PY
 
 ### 4. 写极简 README
 
-只写三件事：**每个 bin 写哪个地址**、**整合 bin 怎么用**、**整片擦除命令**。
+只写这几件事：**每个 bin 写哪个地址**、**整合 bin 怎么用**、**整片擦除命令**、
+**（若 IDF 有改动）如何打 patch 复原出同一个 bin**。
 芯片名、偏移、文件名**全部从 `project_description.json` 和 `flash_files` 取，不要凭记忆写**。
+
+`README.md` 里的 IDF 版本号从 `git -C "$IDF_PATH" rev-parse HEAD` 和 `describe` 取，
+不要写 `git_revision`（那是 IDF 自己的可读版本串，不是可复原的 commit）。
 
 ````markdown
 # <project_name> 固件包
@@ -296,6 +563,39 @@ esptool.py --chip <target> -p <PORT> write_flash <off1> <bin1> <off2> <bin2>
 - **换了分区表就必须整片擦除**：`esptool.py --chip <target> -p <PORT> erase_flash`
 - 首次烧录建议先 `erase_flash`，避免 nvs 里残留旧配置
 - flash 参数：<flash_mode> / <flash_freq> / <flash_size>
+
+## 从源码重建（binary 一致所必需）
+
+本包的 bin 是在**改过的 IDF** 上编译的。**不打 patch 直接编，出来的固件不一样。**
+
+IDF 基线：
+
+```
+版本：<如 v5.5.1>
+commit：<IDF_PATH 的 git rev-parse HEAD>
+```
+
+复原步骤：
+
+```bash
+# 1. 取到同一基线的 IDF
+git clone -b <tag> https://github.com/espressif/esp-idf.git
+cd esp-idf && git checkout <commit>
+
+# 2. 打上本包附带的 patch（在本包目录里执行）
+git apply /path/to/idf-modifications.patch
+
+# 3. 后续按官方 install / export 流程，然后在工程目录 idf.py build
+```
+
+被修改的文件清单：
+
+| 文件 | 改动摘要 |
+|---|---|
+| <components/xxx.c> | <一句话说明改了什么> |
+
+> 若本包**没有** `idf-modifications.patch`，说明 IDF 无改动，用上面那个 commit 的干净 IDF
+> 即可复现。
 ````
 
 ### 5. 两份源码包
@@ -380,6 +680,10 @@ PY
 - [ ] README 里的地址/文件名和 `flash_files` 逐行一致
 - [ ] 两个 zip 都能打开，且都不含 `build*/`、`.git/`、`.vscode/`
 - [ ] 泄露扫描已跑过，命中项已报告给用户
+- [ ] **IDF 改动已检查**：若干净，README 里写明"无 patch，用 <commit> 即可"；
+      若有改动，`idf-modifications.patch` 已产出、`git apply --check` 已通过、
+      README 里写清了基线 commit + 复原命令 + 被改文件清单
+- [ ] **patch 里没有行尾噪声**：文件数应等于真实改动文件数，不是上万
 - [ ] 把整个 release 目录列给用户，附每个文件的大小
 
 ---
@@ -402,6 +706,15 @@ PY
 | `flasher_args.json` 过期 | 改过分区表没重编 → 偏移是旧的，烧了不亮 |
 | 改分区表但只烧 app | 必须 `erase_flash` |
 | 整合 bin 从 0x1000 写 | 必须从 **0x0** |
+| **不检查 IDF 改动** | 开发时改过 IDF，光给源码包**复现不出同一个 bin**，且往往"能跑但行为不对" |
+| **拿整个 `git diff` 当 patch** | Windows 上 IDF 常有一万多文件的行尾差异，会产出几十 MB 的垃圾 patch |
+| **出 diff 不加 `-c core.autocrlf=true`** | 即使文件筛对了，**整文件也会显示成全删全增**（实测 `+323/-258` 而非 `+67/-2`），patch 不可读且易失败 |
+| **用 `--ignore-cr-at-eol` 去筛文件** | 它对 `--name-only` **无效**（仍返回上万文件）；只对 diff/numstat 的内容输出有效 |
+| **把 `mode 120000` 的 DELETED 写进 patch** | Windows 解压不落地软链接，不是人为改动；纳入后接收方 `git apply` 会**误删文件** |
+| **只看 `apply --check` 通过就收工** | 还要逐字节比对打完后与开发机是否一致，`apply` 成功不等于内容对 |
+| **patch 里写了 `git_revision`** | 那是可读版本串，不可复原；要用 `git rev-parse HEAD` 的完整 commit |
+| **`ESP_ROM_ELF_DIR` 照抄别人的** | build/ 里没有记录，路径含 `tools` 一层，版本号可能是 `20241011` 而非 `20240411` |
+| **目录名直接用 commit 摘要** | Windows 不允许 `:`，需替换成 `_` |
 
 ---
 
@@ -410,7 +723,7 @@ PY
 交付时一次性给出：
 
 ```
-release/<序号>. <说明>/
+release/<YYYYMMDD-HHMMSS>_<project_name>/
 ├── firmware/
 │   ├── <project>-<date>-<hash>.bin   1.09 MB   ← 0x0 一次写入
 │   ├── bootloader.bin                 23 KB    ← 0x2000
@@ -418,7 +731,11 @@ release/<序号>. <说明>/
 │   └── <project>.bin                 1.01 MB   ← 0x10000
 ├── src-full-<date>.zip               xx MB
 ├── src-lite-<date>.zip               xx KB
+├── idf-modifications.patch           xx KB     ← 仅在 IDF 有改动时出现
 └── README.md
 ```
 
 外加一句：**"整合 bin 从 0x0 写，分文件按 README 里的地址写；换过分区表的话先 erase_flash。"**
+
+如果 IDF 有改动，还要额外说明：**"这个 bin 是在改过的 IDF 上编的，重建前必须先打
+`idf-modifications.patch`，基线 commit 写在 README 里。"**
