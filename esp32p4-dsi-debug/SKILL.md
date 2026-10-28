@@ -1,14 +1,19 @@
 ---
 name: esp32p4-dsi-debug
 description: >
-  调试 ESP32-P4 MIPI DSI 显示异常（画面斜线/错位/撕裂/反色/花屏）与
-  TDDI 触屏不报点的实战方法。包含 P4 DSI 时钟链的整数截断陷阱、
-  时序量与速率的区分方法、用 VPG 自检图案切分故障域、INT_ST1 与
-  bridge FIFO 的读法、RGB888 字节序、以及一套已验证可用的
-  VFP=166 + DPI=30MHz + lane=480 参数。Use when the user reports
-  ESP32-P4 DSI 画面斜线 / 错位 / 竖条歪 / 分段 / 撕裂 / 反色 /
-  颜色不对 / 触屏不工作 / TDDI 无报点 / VFP / porch / lane bitrate
-  / dpi clock / VID_HLINE_TIME / mipi_dsi / esp_lcd_panel_dpi.
+  调试 ESP32-P4 MIPI DSI 显示异常（画面斜线/错位/撕裂/反色/花屏/颜色不对）
+  与 TDDI 触屏不报点的实战方法。包含 P4 DSI 时钟链的整数截断陷阱、
+  时序量与速率的区分方法、porch 作为功能量（VBP 决定颜色、VFP 决定触控扫描）、
+  用 VPG 自检图案切分故障域及其边界、INT_ST1 与 bridge FIFO 的读法、
+  RGB888 字节序、从面板读寄存器（DSI 读通路的四个坑）、以及
+  "不改 IDF 直接用 hal 私有 inline 改 host 行为"的做法。
+  含两套已验证参数：VFP=166 + DPI=30MHz + lane=480（480x800），
+  VBP=6 + DPI=40MHz + lane=640/800（540x810 incell）。
+  Use when the user reports ESP32-P4 DSI 画面斜线 / 错位 / 竖条歪 / 分段 /
+  撕裂 / 反色 / 颜色不对 / 单通道变补色 / 读不到面板寄存器 /
+  DCS read / gen_rd_cmd_busy / 触屏不工作 / TDDI 无报点 / VFP / VBP /
+  porch / lane bitrate / dpi clock / VID_HLINE_TIME / mipi_dsi /
+  esp_lcd_panel_dpi.
 ---
 
 # ESP32-P4 DSI 调试
@@ -17,6 +22,21 @@ description: >
 
 > **P4 的 DSI 时钟链有三处整数截断。绝大多数"画面斜线/错位"类问题，
 > 根因是这个，不是面板、不是初始化、不是 burst 模式。**
+>
+> **但"颜色不对"是另一条线** —— 多半不是时钟，而是 porch（尤其 VBP）与
+> 面板的匹配问题。见第十三节。
+
+## 零、症状 → 章节
+
+| 症状 | 先看 |
+|---|---|
+| 竖条被扭成斜线 / 分段 / 错位 / 撕裂 | 二 ~ 五（时钟链与 ratio） |
+| 颜色不对、单通道满值变成补色、双通道满值变淡色 | **十三（porch 是功能量）** |
+| 红蓝互换、白黑正常 | 八（字节序） |
+| 整屏反色（白变黑） | 八（多半是 flush 里多做了一次 R/B 交换） |
+| 读不到面板寄存器 / 读一次就黑屏 | **十四（DSI 读通路）** |
+| 想在不动 IDF 的前提下改 host 行为 | **十五（hal 私有 inline）** |
+| 画面正常但触屏不报点 | 七（VFP）+ 七·附（incell 差异） |
 
 ---
 
@@ -36,11 +56,30 @@ esp_lcd_dpi_panel_set_pattern(mipi_dsi_panel, MIPI_DSI_PATTERN_BAR_VERTICAL);
 
 | VPG 图案 | 说明 | 故障域 |
 |---|---|---|
-| 干净、笔直、无扭曲 | 面板 / PHY / init 序列 / COLMOD / lane 数 / sync 极性 / **host 全套时序寄存器** 全对 | bridge 的 DPI 写入通路 |
+| 干净、笔直、无扭曲 | 面板 / PHY / init 序列 / COLMOD / lane 数 / sync 极性 / **host 全套时序寄存器** 全对 | 数据来源侧（framebuffer / bridge DPI 通路 / LVGL 缓冲） |
 | 也歪 / 也花 | 问题在更下游或面板本身 | PHY / 面板 |
 
 **注意**：VPG 走 host 内部，**不经过 framebuffer 和 bridge**，所以它同时也证明了
 像素格式、通道顺序之外的链路是好的。
+
+### ⚠️ VPG 的边界：它对"颜色"不是干净的判据
+
+VPG 只绕过了 framebuffer 和 bridge，**没有绕过 host 的打包器和 PHY**。
+所以当问题出在"包怎么发出去"这一层（时序错位、porch 不匹配、lane 上字节对齐）
+时，**VPG 会一样错**。
+
+实测反例（540×810 incell，VBP 少 2 行）：VPG 八色条显示成
+
+```
+白 淡蓝 淡红 粉紫 淡绿 青 黄 黑
+```
+
+八条的**身份和顺序都对**（就是标准 8 色条），但每条的颜色全变了 —— 而且
+8/8 都符合同一个"两字节平均"的规律。这时候如果按"VPG 干净 → 链路没问题"
+去判，会直接错过真因。
+
+**所以：用 VPG 判几何/是否出图，不要用 VPG 判颜色。**
+颜色请走第十三节的判据表。
 
 图案类型（`mipi_dsi_pattern_type_t`）：
 
@@ -152,6 +191,11 @@ mipi_dsi_host_ll_dpi_set_horizontal_timing(hal->host,
 | **时序量** | HSYNC / HBP / HFP / VSYNC / VBP / VFP、`VID_HLINE_TIME`、porch | **不要改**。改了会破坏与面板初始化序列的匹配，也破坏行内比例 |
 | **速率** | `lane_bitrate`、`byteclk`、`ratio` | 可以改，这是唯一应该动的维度 |
 
+> **例外 —— porch 不是"装饰"**：上表"不要改"针对的是**几何类**问题（改 hline 会让每行
+> 固定错位，是换一种坏法）。但进 porch 的 VBP/VFP 同时是**功能量**：
+> VFP 不够则触控扫描不完（第七节），VBP 错位会让面板解包错位、颜色全错（第十三节）。
+> 正确姿势是：**porch 跟面板数据手册对齐**，对齐之后不再拿它当调几何的旋钮。
+
 关键恒等式：
 
 ```
@@ -239,6 +283,30 @@ hline = 1152，byteclk = 60MHz，行时间 = 19.2us     ← 与像素行精确�
 **注意**：`DPI=32` 或 `DPI=34` 这类值**不行**，因为 `240/32=7` 余 16，
 真实时钟变成 `240/7=34.2857`，又回到截断问题。**只有 240 的约数才安全**：
 `24, 30, 40, 48, 60`（对应 div `10, 8, 6, 5, 4`）。
+
+### 第二套：540×810 incell TDDI（RGB888，2 lane）
+
+```c
+#define HSW  10
+#define HBP 120
+#define HFP 120
+#define VSW  13
+#define VBP   6        // ★ 8 会颜色全错，6 才对（第十三节）
+#define VFP 110
+
+#define DPI_CLK_MHZ        40     // 240/6 = 40.0000，零截断
+#define LANE_NUM            2
+#define LANE_MBPS         640     // ratio = 640/40/8 = 2.0（实测 800 也正常，ratio 2.5）
+```
+
+```
+HTOTAL = 790，VTOTAL = 939
+帧率 = 40e6/(790*939) = 53.92 Hz
+垂直消隐 = 129 行 * 19.75us = 2.548 ms
+```
+
+两套参数说明同一件事：**DPI 取 240 的约数、ratio 取整数**是通用的；
+而 **VBP/VFP 只能由面板给**，各面板不同，不能照抄。
 
 ---
 
@@ -346,6 +414,24 @@ TDDI（触控集成在显示驱动 IC 里）的**触控扫描必须插在垂直�
 
 > 所以"画面正常但触屏不动"时，**先看 VFP**，不要先怀疑 I2C 地址或驱动。
 
+### 附：incell 面板（触摸与显示同 die）的额外差异
+
+外挂触摸 IC（上面这套经验）与 incell TDDI 在工程上差别不小：
+
+| 项 | 外挂 IC（如 ILITEK） | incell TDDI（如 AXS15260） |
+|---|---|---|
+| 复位 | 独立 RESX | **与显示同一颗 die**：复位 TP = 复位整颗芯片，之后显示寄存器要重配 |
+| 时序要求 | — | TP 复位必须在 LCD 复位之后；TP 寄存器读写必须放在显示初始化**之后**，且与 `11h/29h` 间隔 >100ms |
+| INT | 有数据才拉低 | 常见**每帧一个脉冲**（空闲也在打），所以要按"读回来是不是有效帧"过滤 |
+| 读长度 | 按协议包长 | 按**实际点数**算：头 2 字节 + 每点 6 字节。按最大 5 点读 32 字节会把相邻寄存器读进来，表现为"周期性重复的垃圾帧" |
+
+**无效帧的判据**：`buf[1] >> 4 != 0` 直接丢（原厂驱动同款判断）。
+**不要**用"把点数夹紧到合法范围"的方式处理——那只是把无效帧伪装成合法帧，
+会打出 `X=4095 Y=4095` 这种满量程假点。
+
+**结构上**：INT 下降沿 → ISR 只给信号量 → 任务里读字节 → 队列 → 前台解析。
+不要照抄原厂"在中断回调里做 I2C 读"的写法（它自己的注释都写着会丢中断）。
+
 ---
 
 ## 八、RGB888 字节序：硬件要 BGR
@@ -387,6 +473,9 @@ typedef struct { uint8_t blue; uint8_t green; uint8_t red; } lv_color_t;
 ---
 
 ## 九、IDF 侧可能需要打的补丁
+
+> **先看第十五节。** 多数"IDF 不给这个能力"的情况**不需要改 IDF**——
+> 直接包含 `hal/*_ll.h` 里的 `static inline` 就能调。改源码是最后手段。
 
 本类面板的初始化命令用 DCS 短包发送时，某些固件不认。IDF 默认走：
 
@@ -446,6 +535,14 @@ mipi_dsi_hal_host_gen_write_generic(hal, vc, payload, payload_size);
   ├─ 1. 读到的包首是不是 0x5A（不是 → 触控从未扫描）
   ├─ 2. VFP 是否 ≥ 140（消隐窗口 ≥ 2.541ms）★ 最常见
   └─ 3. I2C 地址（常见 0x41，注意不是出厂默认 0x55）
+
+颜色不对
+  ├─ 1. 别先猜通道顺序。按第十三节的四组观测归类（单通道×3 + 白 + 黑）
+  ├─ 2. "单通道满值→补色、双通道满值→淡色、白黑正常"
+  │     → 位级交织：查 porch，先动 VBP ★ 本类最常见
+  ├─ 3. 红↔蓝互换、绿/白/黑不变 → 字节序（第八节）
+  ├─ 4. 整屏反相（白变黑）→ flush 里多做了一次 R/B 交换
+  └─ 5. 以上都不是 → 再查 color format / lane / burst / 拷贝路径
 ```
 
 ---
@@ -468,3 +565,213 @@ mipi_dsi_hal_host_gen_write_generic(hal, vc, payload, payload_size);
 | VFP 太小 | 触屏扫描窗口不足，I2C 能通但不报点 |
 | 高频轮询不加 yield | 触发 task_wdt，污染采样数据 |
 | 改了 IDF 没记录 | 换机器编出来的固件行为不同，且不报错 |
+| 用 VPG 判颜色 | VPG 只绕过 framebuffer/bridge，没绕过打包器；porch 错时它一样错 |
+| 颜色错就先查字节序/格式 | 本类真因常是 VBP 与面板不匹配，改格式全无效 |
+| 用颜色名字当证据 | "粉"和"紫"分不清；用"单通道/双通道/白/黑"四组结构判 |
+| 读请求按 HS 发（默认值） | 写走 LP、读走 HS，面板收不到，`gen_rd_cmd_busy` 永久为 1 |
+| 在初始化表中途读寄存器 | 读挂了剩下半张表全丢，屏必黑，且不可恢复 |
+| 指望 `TO_CNT_CFG` 超时解脱 | 那是竞争检测计数器，TRM 明写"不产生中断" |
+| 以为 `reset_register()` 会复位 host | 它只复位 `reg_rst_en_dsi_brg`（bridge） |
+| 无效帧"夹紧点数" | 把无效帧伪装成合法帧，会打出满量程假点；应整帧丢弃 |
+
+---
+
+## 十三、porch 是功能量：VBP 决定颜色
+
+上一版把 porch 整块归进"时序量，不要随便改"（第四节）。那条对**几何问题**成立，
+但不能推广：porch 不只是"给行末留余量"，它决定面板的行为状态。
+
+### 实测：VBP 8 → 6，颜色从错变对
+
+540×810 incell TDDI，RGB888，burst，2 lane。`VBP=8` 时 LVGL 画纯红绿蓝得到：
+
+```
+红 → 青      绿 → 粉      蓝 → 黄      白 → 白      黑 → 黑
+```
+
+只把 `VBP` 从 8 改成 6，其它参数一个没动，**全部正常**。（面板厂 FAE 给的数字。）
+
+### 判据：从"颜色错成什么样"反推故障类别
+
+不要用颜色名字（"粉"还是"紫"）当证据，用**结构**判：
+
+| 观测 | 结论 |
+|---|---|
+| 单通道满值 → **补色**；双通道满值 → **淡色**；白/黑正常 | **位级交织** —— 每个输出通道拿到的是另外两个源字节的一部分。查 porch（尤其 VBP），或包的字节对齐 |
+| 红↔蓝 互换，绿/白/黑不变 | 通道顺序（BGR vs RGB） |
+| 白→黑、黑→白，所有颜色都变补色 | 整屏反相 |
+| 灰阶出现台阶/偏色，颜色发暗 | 位宽（18 vs 24bit）或位打包 |
+
+**"单通道满值变补色 + 双通道满值变淡色 + 白黑正常"这一组是位级交织的指纹**：
+反相会让白变黑，通道排列会让红变蓝且不会"变淡"，都对不上。
+
+拟合出来的规律（本类面板实测的 8 组观测全部命中）：
+
+```
+R_out = (b1 + b2) / 2      G_out = (b0 + b2) / 2      B_out = (b0 + b1) / 2
+```
+
+推论：这种状态下**纯色根本出不来**（要 R_out=1 就得 G=B=1，于是 R 被拉回 0.5），
+所以靠软件预补偿救不回来，必须修时序。
+
+### 为什么 porch 会影响颜色
+
+burst 模式下一行的像素被打成一个包连续发完，然后回 LP 等下一个行同步。
+VBP 决定面板在垂直消隐里等多久。差两行，面板的接收状态机与包的到达时刻就错位，
+解包时把相邻字节当成同一个通道的高低位 —— 于是出现"两两平均"的效果。
+
+所以排查顺序是：**先确认 porch 与面板规格匹配，再怀疑色彩链路**。
+
+### 配色问题的排除清单（本类面板实测全部无效）
+
+`in_color_format` 换 RGB565/RGB666、`pixel_type.raw_type`、`pixel_type.dpi_config` 0~3
+四档、`rgb_ele_order`、sync 极性四种组合、clock lane HS/AUTO、burst ↔ non-burst、
+`VID_NUM_CHUNKS`、`VID_NULL_SIZE`、2D-DMA 拷贝 vs 直写内部 framebuffer ——
+对"位级交织"这个现象**全都没有任何影响**。
+
+> 判断原则：如果你已经把"颜色链路"从头到尾排除干净，问题还在，
+> 那说明分类维度错了。颜色不只是"字节怎么排"，还有"包什么时候到"。
+
+### 测试图怎么设计
+
+- **一屏一次只放一个映射**：整屏纯色轮播（红→绿→蓝→白→黑，每 2 秒一换），
+  不要一屏 8 条彩条。彩条要同时判 8 个映射，相机的白平衡和人眼都会引入误差。
+- 每组至少覆盖：**三个单通道满值 + 白 + 黑**。少了白/黑这两条，
+  "反相"和"位级交织"分不开。
+- 手写测试图时把期望值打到串口（`预期 RGB = FF0000`），和屏幕实际颜色一对一对照。
+
+---
+
+## 十四、从面板读寄存器（IDF 的空白区）
+
+要证明"初始化到底生效没有"，读回面板寄存器是最硬的证据。IDF 这条路基本不可用。
+
+### IDF 的现状
+
+```
+esp_lcd_panel_io_rx_param()
+└─ panel_io_dbi_rx_param()                      esp_lcd_panel_io_dbi.c
+   └─ mipi_dsi_hal_host_gen_read_dcs_command()
+      └─ read_short_packet(..., MIPI_DSI_DT_DCS_READ_0, ...)   ← DT 写死 0x06
+```
+
+四个坑：
+
+1. DT 写死 DCS Read(`0x06`)，没有 Generic Read(`0x04/0x14/0x24`)
+2. 三处裸 `while`，**无超时** → 面板不响应就 task_wdt
+3. `rx_param()` 恒返回 `ESP_OK`，读没读到上层不知道
+4. 读完**不恢复 video mode**（`mipi_dsi_hal.c` 里关了，只有 panel init 会开）→ 画面停
+
+### 最致命的坑：读请求有独立的速度位，默认 HS
+
+`DSI_HOST_CMD_MODE_CFG (0x0068)`：
+
+| 位 | 字段 | 复位值 |
+|---|---|---|
+| 19 | `DCS_SR_0P_TX` | 0 = **HS** |
+| 12~14 | `GEN_SR_0P/1P/2P_TX` | 0 = **HS** |
+| 24 | `MAX_RD_PKT_SIZE`（0x37 包的传输速度） | 0 = **HS** |
+
+IDF 只设写方向（`DCS_SW_*_TX` / `DCS_LW_TX` / `GEN_SW_*_TX` / `GEN_LW_TX`），
+**读方向从来不管**。所以"写走 LP、读走 HS"是默认状态。
+
+面板如果只实现了 LP（LPDT）命令入口（便宜的 TDDI 基本都这样），HS 的读请求它**收不到**，
+于是不回 BTA。后果不是"读不到"，而是：
+
+```
+gen_rd_cmd_busy 永久为 1
+  → 那个读包永久占住命令 FIFO
+  → 之后所有写命令 ESP_ERR_TIMEOUT
+  → 画面黑，且软件无法恢复
+```
+
+**修法**：读之前把这几位也设成 LP，跟写命令保持一致。
+本类面板实测：改完一次读通。
+
+### 几个"看起来像超时"的寄存器，其实不是
+
+| 寄存器 | 真相 |
+|---|---|
+| `DSI_HOST_TO_CNT_CFG (0x0078)`（hstx/lprx） | **竞争检测**计数器，TRM 原话"不会产生中断"，清不掉 `gen_rd_cmd_busy` |
+| `DSI_HOST_HS_RD_TO_CNT` / `LP_RD_TO_CNT` | 同上：链路静止时间，"不会产生中断" |
+| **`DSI_HOST_PHY_TMR_RD_CFG (0x00F4)` `MAX_RD_TIME`** | **这才是读命令的看门狗**，单位 lane byte clock；IDF 给 6000（≈60µs @100MHz），偏紧 |
+
+设了前两个以为能兜底，是常见的误判。
+
+### 读卡死后唯一的恢复路径
+
+`gen_rd_cmd_busy` 是只读状态位，只有"整个响应进入 FIFO"才会清。而：
+
+- `mipi_dsi_ll_reset_register()` 实际写的是 `hp_rst_en0.reg_rst_en_dsi_brg`
+  —— **只复位 bridge，不复位 host**
+- `mipi_dsi_phy_ll_reset()` 只复位 PHY
+- 唯一有效的是把 host 的 `pwr_up.shutdownz` 拉低再放开（TRM 43.4.3.1.2：关闭状态会
+  重置所有数字逻辑），然后**重新走一遍** `esp_lcd_new_dsi_bus()` /
+  `new_panel_dpi()` / 初始化表
+
+所以工程上要把显示 bringup 写成**可重复调用的函数**：读失败就整体重建一次
+（这次不带读），保证屏幕一定能起来。
+
+### 三条规矩
+
+1. **读只能在面板已经能应答时做**（至少 `11h` 之后）
+2. **绝不能在初始化表发到一半时读** —— 读挂了剩下半张表全丢，屏必黑
+3. 软件超时给到几十毫秒以上；不要指望硬件超时
+
+### 怎么确认读到的不是垃圾
+
+读 `0x0A`（RDDPM）。`11h`(sleep out) + `13h`(normal) + `29h`(display on) 之后应为：
+
+```
+0x9C = 1001 1100b
+       bit7 booster=1   bit4 sleep_out=1   bit3 normal=1   bit2 display_on=1
+```
+
+读到 `0x00` / `0xFF` / 随机值都说明没通。想进一步证明"读的是实时状态"，
+可以发 `0x28`(display off) 再读一次，`display_on` 位应跟着 1→0→1 变。
+
+---
+
+## 十五、不改 IDF：用 hal 的 static inline 直接改 host 行为
+
+第九节那种"改 IDF 源码打补丁"能解决问题，但代价是：换台机器用干净 IDF 编出来的
+固件行为不一样，而且不报错。
+
+**更干净的办法**：IDF 的 `hal/*_ll.h` 全是 `static inline` 的寄存器读写封装，
+编译时直接内联进你自己的编译单元。只要让组件能看到这些头文件，就能调 ——
+**一行 IDF 源码都不用动**。
+
+```cmake
+idf_component_register(SRCS "dsi_ext.c"
+                       INCLUDE_DIRS "include"
+                       REQUIRES esp_lcd esp_mm esp_timer
+                       PRIV_REQUIRES hal soc)       # ← 整个方案的开关
+```
+
+```c
+#include "hal/mipi_dsi_host_ll.h"
+#include "hal/mipi_dsi_brg_ll.h"
+
+dsi_host_dev_t *host = MIPI_DSI_LL_GET_HOST(0);
+dsi_brg_dev_t  *brg  = &MIPI_DSI_BRIDGE;
+```
+
+这套能覆盖到的能力（都已上板验证）：
+
+| 能力 | IDF 的缺口 |
+|---|---|
+| 任意 DT 发命令（0x03/05/13/15/29/39） | `tx_param()` 把 DT 写死成 DCS |
+| 真正的读（任意 DT + 超时 + 恢复 video mode） | 见第十四节 |
+| 读请求速度 `DCS_SR_*_TX` | 复位 HS，IDF 不设 |
+| 命令 ACK / 各类命令的 LP·HS 速度 | `io_dbi.c` 默认打开 cmd_ack，bus 超时全 0 → 会死锁 |
+| 同步极性 5 个 / clock lane 状态 | `dpi_panel_init()` 写死 |
+| `pixel_type.raw_type` / `dpi_config` | 永远写 0 |
+| VPG 图案 | 有 API，但容易忘关 |
+| 直写面板内部 framebuffer | 只能走 `draw_bitmap` 那条拷贝 |
+
+现成实现：`martlet-tech/esp_dsi_ext`（ESP Component Registry 已发布；
+本类面板就是用它把读通路调通的），或者按上面的方式自己抽一个。
+
+**代价**：依赖私有头文件，升级 IDF 后要复查能不能编过；声明了 `PRIV_REQUIRES hal soc`
+等于在构建系统里明示"我在用私有接口"。换来的好处是：多个工程共用同一份干净 IDF，
+不用维护多份 patch。
