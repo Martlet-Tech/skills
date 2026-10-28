@@ -1,19 +1,24 @@
 ---
 name: esp32p4-dsi-debug
 description: >
-  调试 ESP32-P4 MIPI DSI 显示异常（画面斜线/错位/撕裂/反色/花屏/颜色不对）
-  与 TDDI 触屏不报点的实战方法。包含 P4 DSI 时钟链的整数截断陷阱、
+  点亮与调试 ESP32-P4 MIPI DSI 屏幕的实战方法。开篇是从零 bring-up 的完整流程
+  （要齐哪些参数、从 IDF 例程起手、工程骨架与 screen/touch/lv_port 的接口契约、
+  十步点亮顺序、点不亮时的排查顺序）；后面是按症状索引的诊断章节：
+  画面斜线/错位/撕裂/反色/花屏/颜色不对、TDDI 触屏不报点。
+  包含 P4 DSI 时钟链的整数截断陷阱、
   时序量与速率的区分方法、porch 作为功能量（VBP 决定颜色、VFP 决定触控扫描）、
   用 VPG 自检图案切分故障域及其边界、INT_ST1 与 bridge FIFO 的读法、
   RGB888 字节序、从面板读寄存器（DSI 读通路的四个坑）、以及
   "不改 IDF 直接用 hal 私有 inline 改 host 行为"的做法。
   含两套已验证参数：VFP=166 + DPI=30MHz + lane=480（480x800），
   VBP=6 + DPI=40MHz + lane=640/800（540x810 incell）。
-  Use when the user reports ESP32-P4 DSI 画面斜线 / 错位 / 竖条歪 / 分段 /
+  Use when the user 要点亮一块新屏 / 接到一份没见过的初始化序列 /
+  需要屏驱动的工程结构（screen.c / touch.c / lv_port.c 怎么分层）/
+  reports ESP32-P4 DSI 画面斜线 / 错位 / 竖条歪 / 分段 /
   撕裂 / 反色 / 颜色不对 / 单通道变补色 / 读不到面板寄存器 /
   DCS read / gen_rd_cmd_busy / 触屏不工作 / TDDI 无报点 / VFP / VBP /
   porch / lane bitrate / dpi clock / VID_HLINE_TIME / mipi_dsi /
-  esp_lcd_panel_dpi.
+  esp_lcd_panel_dpi / panel bring-up / init sequence / 初始化表.
 ---
 
 # ESP32-P4 DSI 调试
@@ -26,10 +31,161 @@ description: >
 > **但"颜色不对"是另一条线** —— 多半不是时钟，而是 porch（尤其 VBP）与
 > 面板的匹配问题。见第十三节。
 
+---
+
+## 开篇：点亮一块新屏（bring-up）
+
+> 第一到十五节都是"已经亮、但不对"的诊断。这里是从零开始的那一段。
+> 拿到一块没见过的大屏 + 一份格式各异的初始化序列时，按这个顺序走。
+
+### 1. 先要齐四样东西
+
+| 要什么 | 从哪来 | 缺了会怎样 |
+|---|---|---|
+| 分辨率 + 六个 porch | 面板规格书 / 供应商参考配置 | **点不亮或颜色错**，猜不出来 |
+| lane 数 + 每 lane 速率 | 同上 | 斜线 / 花屏 / 完全没图 |
+| 初始化序列 + **每条的数据类型** | 原厂 lua / C 数组 / Excel / 截图 | 少一条就可能黑屏 |
+| 复位时序、电源、背光 | 原理图 | 复位不对 = 全黑 |
+
+其余（触摸、LVGL、低功耗）都能后补。
+
+**porch 不要猜。** 这是唯一一条建议"停下来发邮件问供应商"的东西 —— 见第十三节
+那个 VBP 差 2 行导致整屏偏色的例子，软件层排除了八轮都没找到，FAE 一句话解决。
+
+### 2. 从能跑的例程起手，别从空工程起手
+
+```bash
+cp -r $IDF_PATH/examples/peripherals/lcd/mipi_dsi ~/proj/my_panel
+cd ~/proj/my_panel
+```
+
+官方例程已经把 DSI 总线、DPI 面板、LVGL 端口、LVGL 依赖、target 配置全摆好了，
+只需要换面板那一块。从空工程起手要把 Kconfig、PSRAM、分区表、LVGL 依赖重踩一遍。
+
+然后装上调试组件，省掉"为了读一个寄存器就去改 IDF"的整条弯路：
+
+```yaml
+# main/idf_component.yml
+dependencies:
+  martlet-tech/esp_dsi_ext: "^0.2.0"
+```
+
+它提供任意 DT 发包、带超时的读、VPG 图案、直写内部 framebuffer —— 都是 `esp_lcd`
+没暴露的，**不需要改 IDF**（原理见第十五节）。
+
+两个现成起点：
+
+- 屏是 incell 540x810 / 2 lane / RGB888 → `esp-dsi-ext` 的
+  `examples/incell_540x810_2lane`（含触摸和 LVGL）
+- 其它任何屏 → `examples/bringup_minimal`（不带 LVGL，排查时干扰最少）
+
+### 3. 工程骨架（照这个切，别让 main.c 变成垃圾场）
+
+```
+main/
+├── board_config.h     引脚 / 电源 / 背光 / 触摸引脚
+├── panel_timing.h     分辨率 / porch / lane / DPI / 像素格式
+├── panel_init.c/h     初始化命令表（生成物，勿手改）
+├── screen.c/h         显示
+├── touch.c/h          触摸
+├── lv_port.c/h        LVGL 端口
+└── app_main.c         只做组装
+```
+
+接口契约 —— 换屏时上层一行不改，就是靠这几个签名：
+
+```c
+/* screen.h —— 不 include lvgl.h */
+esp_err_t screen_power_on(void);      // 电源 / MIPI 开关 / DPHY LDO / 背光关，幂等
+esp_err_t screen_init(void);          // 复位 + DSI + 初始化表 + video mode
+void      screen_destroy(void);       // 可重建（读卡死后要用，见第十四节）
+esp_err_t screen_backlight(bool on);
+esp_err_t screen_fill(uint8_t r, uint8_t g, uint8_t b);   // 纯色自检
+esp_err_t screen_vpg(int pattern);                        // 0=关 1=竖彩条 2=横彩条 3=BER
+esp_lcd_panel_handle_t screen_panel(void);
+uint16_t  screen_width(void);
+uint16_t  screen_height(void);
+
+/* touch.h —— 不 include lvgl.h，也不 include screen.h */
+void      touch_early_pins(void);     // 上电后立刻：三脚进高阻
+esp_err_t touch_init(void);           // 必须在显示初始化之后
+bool      touch_read(uint16_t *x, uint16_t *y, bool *pressed);
+void      touch_deinit(void);
+/* 可选：touch_stats() 给出 INT 脉冲 / 读取 / 无效帧 / 出错四个计数，
+ * 用来区分"INT 在跳但读不出来"和"根本没触发"，排查时很省事。 */
+
+/* lv_port.h —— 唯一认识 LVGL 的胶水层 */
+esp_err_t lv_port_init(esp_lcd_panel_handle_t panel, int w, int h);
+void      lv_port_start(void);
+bool      lv_port_lock(uint32_t timeout_ms);
+void      lv_port_unlock(void);
+```
+
+三条硬规矩：
+
+1. **引脚只在 `board_config.h`，时序只在 `panel_timing.h`。**
+   在 `screen.c` 里看到写死的 `540` 或 `0x1F`，那就是 bug。
+2. **`screen` 和 `touch` 互不知道对方，也都不认识 LVGL。**
+   只有 `lv_port` 同时认识两边 —— 它是胶水层，这是设计不是耦合。
+3. **`app_main` 只按顺序调用，不碰 hal / 寄存器头。**
+   它该 include 的只有 `screen.h` / `touch.h` / `lv_port.h` / `lvgl.h`。
+
+呼吸空间 —— 下面是合理的偏离，别机械照抄：
+
+- 没有触摸的屏：删 `touch.c/h`，`app_main` 少一行
+- 不上 LVGL（纯点亮 / 纯刷图）：删 `lv_port.c/h`，`screen_fill()` 就够
+- 一块板多个屏 / 多个触摸 IC：各自实现同一套头文件，编译期选
+- 引脚和时序都很简单：两个 config 头文件可以合并，但**仍然只有一个地方**定义
+
+只要依赖方向不反（screen/touch 不认识 LVGL、main 不认识寄存器），细节随便。
+
+### 4. 点亮顺序
+
+每一步都有判据，不满足就别往下走：
+
+| # | 做什么 | 成功判据 |
+|---|---|---|
+| 1 | 上电：LCD 电源 → MIPI 开关 → DPHY LDO | 串口能看到每一步 |
+| 2 | 触摸脚进高阻（没触摸就跳过） | P4 不驱动那几根线 |
+| 3 | LCD 复位 | 波形符合手册 |
+| 4 | DSI 总线 + 命令通道（cmd_ack off、写命令走 LP） | 不出现 `ESP_ERR_TIMEOUT` |
+| 5 | 建 DPI 面板对象 | 日志里 HTOTAL/VTOTAL/帧率算得对 |
+| 6 | 发初始化表 | **每条都 ok**，有一条 FAIL 就先解决它 |
+| 7 | 读一次 `0x0A` | 有合理返回值（如 `0x9C`），不是全 0 / 全 FF |
+| 8 | `esp_lcd_panel_init()` 起 video mode | 屏幕有反应 |
+| 9 | 背光开 | — |
+| 10 | **画纯色**（先别上 LVGL） | 红就是红 |
+
+第 10 步特意不用 LVGL：LVGL 会把"初始化没生效"藏起来 —— 画面有内容，
+但内容本身是错的，判断起来反而更难。
+
+### 5. 点不亮时按这个顺序查
+
+| 现象 | 先查 |
+|---|---|
+| 第一条命令就 FAIL | 命令通道：cmd_ack / LP / lane 数 / 总线参数 |
+| 前 N 条 ok、之后全 FAIL | **读请求把命令 FIFO 占死了**，见第十四节 |
+| 全部 ok 但全黑 | 背光 / 复位 / 电源 / 表里缺 `11h`+`29h` |
+| 全黑但 VPG 有图 | framebuffer 内容或 color format |
+| 有图但斜线 / 错位 | 时钟链，第二 ~ 五节 |
+| 有图但颜色错 | **先查 porch，再查颜色链路**，第十三节 |
+
+### 6. 点亮 ≠ 正确
+
+出图只是及格线。往下走之前先确认这五条：
+
+- 四角都有内容（没被裁切、没镜像）
+- 纯红 / 绿 / 蓝的结构对（第十三节那四组判据）
+- 白、黑正常
+- 触摸报点能覆盖全屏四角
+- **连续跑 10 分钟不黑**（时钟余量不够时，往往是跑一会儿才出问题）
+
 ## 零、症状 → 章节
 
 | 症状 | 先看 |
 |---|---|
+| 拿到一块新屏 / 一份没见过的初始化序列，要把它点亮 | **开篇（bring-up）** |
+| 点不亮，不知道从哪下手 | **开篇 · 第 5 小节** |
 | 竖条被扭成斜线 / 分段 / 错位 / 撕裂 | 二 ~ 五（时钟链与 ratio） |
 | 颜色不对、单通道满值变成补色、双通道满值变淡色 | **十三（porch 是功能量）** |
 | 红蓝互换、白黑正常 | 八（字节序） |
